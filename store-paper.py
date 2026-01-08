@@ -26,7 +26,17 @@ def bits_to_bytes(bits):
         out.append(byte << (8 - len(bits) % 8))
     return bytes(out)
 
-def encode_file(input_path, output_pdf, dpi=600, margin_inch=0.5):
+def calculate_dpi_for_pages(total_bits, pages, margin_inch):
+    page_w, page_h = A4
+    # We want to find dpi so that bits_per_page * pages >= total_bits
+    # bits_per_page = (usable_w * usable_h) = ((dpi * (page_w/inch - 2*margin_inch)) * (dpi * (page_h/inch - 2*margin_inch)))
+    # dpi^2 * (usable_width_in_inch * usable_height_in_inch) * pages >= total_bits
+    usable_width_in_inch = (page_w / inch) - 2 * margin_inch
+    usable_height_in_inch = (page_h / inch) - 2 * margin_inch
+    dpi = math.sqrt(total_bits / (pages * usable_width_in_inch * usable_height_in_inch))
+    return int(math.ceil(dpi))
+
+def encode_file(input_path, output_pdf, dpi=600, margin_inch=0.5, pages=None):
     data = open(input_path, 'rb').read()
     compressed = zlib.compress(data, 9)
     meta = META_PREFIX + b'|' + hashlib.sha256(data).hexdigest().encode() + b'|' + str(len(data)).encode() + b'|'
@@ -34,9 +44,46 @@ def encode_file(input_path, output_pdf, dpi=600, margin_inch=0.5):
     bits = list(bytes_to_bits(payload))
 
     page_w, page_h = A4
-    px_w = int(page_w / inch * dpi)
-    px_h = int(page_h / inch * dpi)
-    margin_px = int(margin_inch * dpi)
+    margin_px_default = margin_inch
+
+    if pages is not None:
+        # Calculate DPI needed to fit bits in pages or less
+        needed_dpi = calculate_dpi_for_pages(len(bits), pages, margin_inch)
+        # If user dpi is given, don't exceed it
+        if dpi is not None and needed_dpi > dpi:
+            used_dpi = dpi
+            # recalc pages at this dpi to see if fits, if not, must accept fewer pages (can't exceed pages)
+            px_w = int(page_w / inch * used_dpi)
+            px_h = int(page_h / inch * used_dpi)
+            margin_px = int(margin_inch * used_dpi)
+            usable_w = px_w - 2 * margin_px
+            usable_h = px_h - 2 * margin_px
+            bits_per_page = usable_w * usable_h
+            total_pages = math.ceil(len(bits) / bits_per_page)
+            if total_pages > pages:
+                # reduce DPI to fit exactly pages by lowering DPI stepwise
+                # This ensures pages <= requested pages
+                while total_pages > pages and used_dpi > 1:
+                    used_dpi -= 1
+                    px_w = int(page_w / inch * used_dpi)
+                    px_h = int(page_h / inch * used_dpi)
+                    margin_px = int(margin_inch * used_dpi)
+                    usable_w = px_w - 2 * margin_px
+                    usable_h = px_h - 2 * margin_px
+                    bits_per_page = usable_w * usable_h
+                    total_pages = math.ceil(len(bits) / bits_per_page)
+        else:
+            used_dpi = needed_dpi
+        print(f"Using DPI: {used_dpi} to fit into {pages} pages (requested).")
+    else:
+        used_dpi = dpi
+        px_w = int(page_w / inch * used_dpi)
+        px_h = int(page_h / inch * used_dpi)
+
+    # calculate usable area
+    px_w = int(page_w / inch * used_dpi)
+    px_h = int(page_h / inch * used_dpi)
+    margin_px = int(margin_inch * used_dpi)
     usable_w = px_w - 2 * margin_px
     usable_h = px_h - 2 * margin_px
     bits_per_page = usable_w * usable_h
@@ -50,12 +97,12 @@ def encode_file(input_path, output_pdf, dpi=600, margin_inch=0.5):
         chunk = bits[start:start + bits_per_page]
         img = Image.new('1', (usable_w, usable_h), 1)
         img.putdata(chunk + [1] * (usable_w * usable_h - len(chunk)))
-        img = img.resize((usable_w, usable_h), Image.NEAREST)
+        # No need to resize since img is already usable_w x usable_h
         img_byte = io.BytesIO()
         img.save(img_byte, format='PNG')
         img_byte.seek(0)
-        c.drawImage(ImageReader(img_byte), margin_px / dpi * 72, margin_px / dpi * 72,
-                    width=usable_w / dpi * 72, height=usable_h / dpi * 72)
+        c.drawImage(ImageReader(img_byte), margin_px / used_dpi * 72, margin_px / used_dpi * 72,
+                    width=usable_w / used_dpi * 72, height=usable_h / used_dpi * 72)
         c.showPage()
     c.save()
     print(f"Done. Written to {output_pdf} ({total_pages} pages).")
@@ -96,9 +143,10 @@ def main():
     p.add_argument('output')
     p.add_argument('--dpi', type=int, default=600)
     p.add_argument('--margin', type=float, default=0.5)
+    p.add_argument('--pages', type=int, default=None, help='Number of pages to fit the encoded file into')
     args = p.parse_args()
     if args.mode == 'encode':
-        encode_file(args.input, args.output, args.dpi, args.margin)
+        encode_file(args.input, args.output, args.dpi, args.margin, args.pages)
     else:
         decode_pdf(args.input, args.output, args.dpi, args.margin)
 
